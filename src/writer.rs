@@ -1,5 +1,5 @@
 use dao::Value;
-use database::SqlOption;
+use database::{SqlOption, BuildMode};
 use std::fmt;
 
 /// sql fragment
@@ -8,33 +8,34 @@ pub struct SqlFrag {
     pub sql: String,
     pub params: Vec<Value>,
     pub sql_options: Vec<SqlOption>,
+    pub build_mode: BuildMode,
 }
 
-impl fmt::Display for SqlFrag{
+impl fmt::Display for SqlFrag {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.sql);
+        try!(write!(f, "{}", self.sql));
         let mut do_comma = false;
-        write!(f, "[");
+        try!(write!(f, "["));
         for param in &self.params {
             if do_comma {
-                write!(f, ", ");
+                try!(write!(f, ", "));
             } else {
                 do_comma = true;
             }
-            write!(f, "{}", param);
+            try!(write!(f, "{}", param));
         }
         write!(f, "]")
     }
 }
 
-impl SqlFrag{
-
+impl SqlFrag {
     #[inline]
-    pub fn new(sql_options: Vec<SqlOption>) -> Self {
+    pub fn new(sql_options: Vec<SqlOption>, build_mode: BuildMode) -> Self {
         SqlFrag {
             sql: String::new(),
             params: vec![],
             sql_options: sql_options,
+            build_mode: build_mode,
         }
     }
 
@@ -128,15 +129,22 @@ impl SqlFrag{
         self.append("-- ");
         self.append(comment)
     }
-    ///append parameter including the needed sql keywords
+    /// append parameter including the needed sql keywords
     pub fn parameter(&mut self, param: Value) {
-        self.params.push(param);
-        if self.sql_options.contains(&SqlOption::UsesNumberedParam) {
-            let numbered_param = format!("${} ", self.params.len());
-            self.append(&numbered_param);
-        } else if self.sql_options.contains(&SqlOption::UsesQuestionMark) {
-            self.append("?");
+        match self.build_mode {
+            BuildMode::Standard => {
+                self.params.push(param);
+                if self.sql_options.contains(&SqlOption::UsesNumberedParam) {
+                    let numbered_param = format!("${} ", self.params.len());
+                    self.append(&numbered_param);
+                } else if self.sql_options.contains(&SqlOption::UsesQuestionMark) {
+                    self.append("?");
+                }
+            }
+            BuildMode::Debug => {
+                // use fmt::Display
+                self.append(&format!("{}",&param));
+            }
         }
     }
-
 }

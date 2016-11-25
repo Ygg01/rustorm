@@ -95,3 +95,25 @@ order by schemaname, viewname;
 
 ## September 9, 2015
 * Replace rustc_serialize with serde-rs
+
+
+## October 21, 2015
+* Make mysql as optional dependency
+
+
+## Macro
+
+#[derive(IsDao,IsTable)]
+pub struct Product{
+    #[column(rename="product_name")]
+    name: String,
+    #[render(image_base64)]
+    base64: String,
+}
+
+
+
+
+## April 12, 2016
+
+* Refactor DAO to alias only to type Dao = BTreeMap<String, Value>

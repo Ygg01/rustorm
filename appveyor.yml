@@ -1,0 +1,22 @@
+install:
+  - ps: Start-FileDownload 'https://static.rust-lang.org/dist/rust-nightly-i686-pc-windows-gnu.exe'
+  - rust-nightly-i686-pc-windows-gnu.exe /VERYSILENT /NORESTART /DIR="C:\Program Files (x86)\Rust"
+  - SET PATH=%PATH%;C:\Program Files (x86)\Rust\bin
+  - SET PATH=%PATH%;C:\MinGW\bin
+  - rustc -V
+  - cargo -V
+  - git submodule update --init --recursive
+
+build: false
+
+services:
+  - postgresql  
+
+before_test:
+  - SET PGUSER=postgres
+  - SET PGPASSWORD=Password12!
+  - PATH=C:\Program Files\PostgreSQL\9.4\bin\;%PATH%
+  - .\scripts\setup.bat
+
+test_script:
+  - cargo test --verbose

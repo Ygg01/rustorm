@@ -3,11 +3,23 @@ use table::Table;
 use dao::{Dao, DaoResult, Value};
 use writer::SqlFrag;
 use query::{Connector, Equality, Operand, Field};
-use query::{Direction, Modifier, JoinType};
+use query::{Direction, Modifier, NullsWhere, JoinType};
 use query::{Filter, Condition};
 use query::SqlType;
+use query::Range;
 use std::error::Error;
 use std::fmt;
+use r2d2;
+use postgres::error::Error as PgError;
+use postgres::error::ConnectError as PgConnectError;
+#[cfg(feature = "mysql")]
+use mysql::error::MyError;
+use regex::Error as RegexError;
+#[cfg(feature = "sqlite")]
+use rusqlite::SqliteError;
+use platform::PlatformError;
+use dao::Type;
+use query::source::{SourceField, QuerySource, ToSourceField};
 
 
 /// SqlOption, contains the info about the features and quirks of underlying database
@@ -30,42 +42,99 @@ pub enum SqlOption {
     ReturnMetaColumns,
 }
 
+/// specifies if the sql will be build in debug mode for debugging purposed
+#[derive(PartialEq)]
+#[derive(Clone)]
+pub enum BuildMode {
+    /// build in debug mode
+    Debug,
+    /// build in standard mode
+    Standard,
+}
+
 #[derive(Debug)]
-pub struct DbError {
-    description: String,
-    cause: Option<String>,
+pub enum DbError {
+    Error(String),
+    PoolError(r2d2::InitializationError),
+    PlatformError(PlatformError),
 }
 
-/// rough implementation of Database errors
-impl DbError{
+impl DbError {
     pub fn new(description: &str) -> Self {
-        DbError {
-            description: description.to_string(),
-            cause: None,
-        }
-    }
-
-    pub fn from_string(description: String) -> Self {
-        DbError {
-            description: description,
-            cause: None,
-        }
+        DbError::Error(description.to_owned())
     }
 }
 
-impl Error for DbError{
+impl Error for DbError {
     fn description(&self) -> &str {
-        &self.description
+        match *self {
+            DbError::Error(ref description) => description,
+            DbError::PoolError(ref err) => err.description(),
+            DbError::PlatformError(ref err) => err.description(),
+        }
     }
 
     fn cause(&self) -> Option<&Error> {
-        None
+        match *self {
+            DbError::Error(_) => None,
+            DbError::PoolError(ref err) => Some(err),
+            DbError::PlatformError(ref err) => Some(err),
+        }
     }
 }
 
 impl fmt::Display for DbError {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        write!(fmt, "{}", self.description())
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            DbError::PoolError(ref err) => write!(f, "Pool error: {}", err),
+            DbError::PlatformError(ref err) => write!(f, "PostgreSQL error: {}", err),
+            DbError::Error(_) => write!(f, "{}", self.description()),
+        }
+    }
+}
+
+impl From<r2d2::InitializationError> for DbError {
+    fn from(err: r2d2::InitializationError) -> Self {
+        DbError::PoolError(err)
+    }
+}
+
+impl From<PlatformError> for DbError {
+    fn from(err: PlatformError) -> Self {
+        DbError::PlatformError(err)
+    }
+}
+
+impl From<RegexError> for DbError {
+    fn from(err: RegexError) -> Self {
+        DbError::new(err.description())
+    }
+}
+
+
+impl From<PgError> for DbError {
+    fn from(err: PgError) -> Self {
+        DbError::PlatformError(From::from(err))
+    }
+}
+
+
+impl From<PgConnectError> for DbError {
+    fn from(err: PgConnectError) -> Self {
+        DbError::PlatformError(From::from(err))
+    }
+}
+#[cfg(feature = "mysql")]
+impl From<MyError> for DbError {
+    fn from(err: MyError) -> Self {
+        DbError::PlatformError(From::from(err))
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl From<SqliteError> for DbError {
+    fn from(err: SqliteError) -> Self {
+        DbError::PlatformError(From::from(err))
     }
 }
 
@@ -77,11 +146,10 @@ impl fmt::Display for DbError {
 /// TODO: acquire only a connection until a query is about to be executed.
 /// generating query don't really need database connection just yet.
 
-pub trait Database{
-
+pub trait Database {
     /// return the version of the database
     /// lower version of database has fewer supported features
-    fn version(&self) -> String;
+    fn version(&self) -> Result<String, DbError>;
 
     /// begin database transaction
     fn begin(&self);
@@ -120,7 +188,7 @@ pub trait Database{
     /// insert an object, returns the inserted Dao value
     /// including the value generated via the defaults
     fn insert(&self, query: &Query) -> Result<Dao, DbError> {
-        let sql_frag = self.build_insert(query);
+        let sql_frag = self.build_insert(query, BuildMode::Standard);
         match self.execute_sql_with_one_return(&sql_frag.sql, &sql_frag.params) {
             Ok(Some(result)) => Ok(result),
             Ok(None) => Err(DbError::new("No result from insert")),
@@ -139,36 +207,87 @@ pub trait Database{
     /// execute query with return dao,
     /// use the enumerated column for data extraction when db doesn't support returning the records column names
     fn execute_with_return(&self, query: &Query) -> Result<DaoResult, DbError> {
-        let sql_frag = &self.build_query(query);
+        let sql_frag = &self.build_query(query, BuildMode::Standard);
         let result = try!(self.execute_sql_with_return(&sql_frag.sql, &sql_frag.params));
-        let dao_result = DaoResult {
-            dao: result,
-            renamed_columns: query.get_renamed_columns(),
-            total: None,
-            page: None,
-            page_size: None,
+        if query.enable_query_stat{
+            let (page, page_size, total) = try!(self.get_query_stats(query));
+            let dao_result = DaoResult {
+                dao: result,
+                renamed_columns: query.get_renamed_columns(),
+                total: total,
+                page: page,
+                page_size: page_size,
+            };
+            Ok(dao_result)
+        }else{
+            let dao_result = DaoResult {
+                dao: result,
+                renamed_columns: query.get_renamed_columns(),
+                total: None,
+                page: None,
+                page_size: None,
+            };
+            Ok(dao_result)
+        }
+    }
+
+    /// get the query stats page, page_size and the total records
+    fn get_query_stats(&self,
+                       query: &Query)
+                       -> Result<(Option<usize>, Option<usize>, Option<usize>), DbError> {
+        let page = if let Some(limit) = query.range.limit {
+            if let Some(offset) = query.range.offset {
+                Some(offset / limit)
+            } else {
+                None
+            }
+        } else {
+            None
         };
-        Ok(dao_result)
+
+        let mut count_query = query.to_owned();
+        count_query.enumerated_fields = vec![];//remove the enumerated fields
+        count_query.column("COUNT(*) AS COUNT");
+        count_query.order_by = vec![];
+        count_query.range = Range::new();//remove the range
+        let debug_sql = &self.build_query(&count_query, BuildMode::Debug);
+        println!("STAT QUERY: {}", debug_sql);
+        let count_result = try!(self.execute_with_one_return(&count_query));
+        println!("range: {:#?}", query.range);
+        println!("count result {:#?}", count_result);
+        let total = if let Some(count_result) = count_result {
+            let value = count_result.get("count");
+            match value {
+                Some(&Value::U64(v)) => Some(v as usize),
+                Some(&Value::I64(v)) => Some(v as usize),
+                Some(&Value::U32(v)) => Some(v as usize),
+                Some(&Value::I32(v)) => Some(v as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        Ok((page, query.range.limit, total))
     }
 
     /// execute query with 1 return dao
     fn execute_with_one_return(&self, query: &Query) -> Result<Option<Dao>, DbError> {
-        let sql_frag = &self.build_query(query);
+        let sql_frag = &self.build_query(query, BuildMode::Standard);
         self.execute_sql_with_one_return(&sql_frag.sql, &sql_frag.params)
     }
 
     /// execute query with no return dao
     fn execute(&self, query: &Query) -> Result<usize, DbError> {
-        let sql_frag = &self.build_query(query);
+        let sql_frag = &self.build_query(query, BuildMode::Standard);
         self.execute_sql(&sql_frag.sql, &sql_frag.params)
     }
 
     /// execute insert with returning clause, update with returning clause
-    fn execute_sql_with_return(&self, sql: &str, params: &Vec<Value>) -> Result<Vec<Dao>, DbError>;
+    fn execute_sql_with_return(&self, sql: &str, params: &[Value]) -> Result<Vec<Dao>, DbError>;
 
     fn execute_sql_with_one_return(&self,
                                    sql: &str,
-                                   params: &Vec<Value>)
+                                   params: &[Value])
                                    -> Result<Option<Dao>, DbError> {
         let dao = try!(self.execute_sql_with_return(sql, params));
         if dao.len() >= 1 {
@@ -179,18 +298,18 @@ pub trait Database{
     }
 
     /// everything else, no required return other than error or affected number of records
-    fn execute_sql(&self, sql: &str, param: &Vec<Value>) -> Result<usize, DbError>;
+    fn execute_sql(&self, sql: &str, param: &[Value]) -> Result<usize, DbError>;
 
     /// build a query, return the sql string and the parameters.
     /// use by select to build the select query
     /// build all types of query
     /// TODO: need to supply the number of parameters where to start the numbering of the number parameters
-    fn build_query(&self, query: &Query) -> SqlFrag {
+    fn build_query(&self, query: &Query, build_mode: BuildMode) -> SqlFrag {
         match query.sql_type {
-            SqlType::SELECT => self.build_select(query),
-            SqlType::INSERT => self.build_insert(query),
-            SqlType::UPDATE => self.build_update(query),
-            SqlType::DELETE => self.build_delete(query),
+            SqlType::SELECT => self.build_select(query, build_mode),
+            SqlType::INSERT => self.build_insert(query, build_mode),
+            SqlType::UPDATE => self.build_update(query, build_mode),
+            SqlType::DELETE => self.build_delete(query, build_mode),
         }
     }
 
@@ -204,31 +323,8 @@ pub trait Database{
                     w.append(&column_name.complete_name());
                 }
             }
-            Operand::TableName(ref table_name) => {
-                if self.sql_options().contains(&SqlOption::UsesSchema) {
-                    w.append(&table_name.complete_name());
-                } else {
-                    w.append(&table_name.name);
-                }
-            }
-            Operand::Function(ref function) => {
-                w.append("(");
-                let mut do_comma = false;
-                for param in &function.params {
-                    if do_comma {
-                        w.commasp();
-                    } else {
-                        do_comma = true;
-                    }
-                    self.build_operand(w, parent_query, param);
-                }
-                w.append(")");
-            }
-            Operand::Query(ref q) => {
-                panic!("TODO: causes error Attributes 'readnone and readonly' are incompatible! \
-                        LLVM ERROR: Broken function found, compilation aborted!")
-                //let sql_frag = &self.build_query(&q);
-                //w.append(&sql_frag.sql);
+            Operand::QuerySource(ref query_source) => {
+                self.build_query_source(w, parent_query, query_source);
             }
             Operand::Value(ref value) => {
                 w.parameter(value.clone());
@@ -238,7 +334,6 @@ pub trait Database{
                 if !operands.is_empty() {
                     w.append("(");
                     for op in operands {
-                        println!("op: {:?}", op);
                         if do_comma {
                             w.commasp();
                         } else {
@@ -249,6 +344,7 @@ pub trait Database{
                     w.append(")");
                 }
             }
+            Operand::None => (), //dont do anything
         }
     }
 
@@ -292,6 +388,10 @@ pub trait Database{
                 w.append("LIKE ");
                 self.build_operand(w, parent_query, &cond.right);
             }
+            Equality::ILIKE => {
+                w.append("ILIKE ");
+                self.build_operand(w, parent_query, &cond.right);
+            }
             Equality::IS_NOT_NULL => {
                 w.append("IS NOT NULL");
             }
@@ -313,13 +413,61 @@ pub trait Database{
         }
     }
 
+    fn build_query_source(&self,
+                          w: &mut SqlFrag,
+                          parent_query: &Query,
+                          query_source: &QuerySource) {
+        match *query_source {
+            QuerySource::TableName(ref table_name) => {
+                if self.sql_options().contains(&SqlOption::UsesSchema) {
+                    w.append(&table_name.complete_name());
+                } else {
+                    w.append(&table_name.name);
+                }
+            }
+            QuerySource::Function(ref function) => {
+                w.sp();
+                w.append(&function.function);
+                w.append("(");
+                let mut do_comma = false;
+                for param in &function.params {
+                    if do_comma {
+                        w.commasp();
+                    } else {
+                        do_comma = true;
+                    }
+                    self.build_operand(w, parent_query, param);
+                }
+                w.append(")");
+            }
+            QuerySource::Query(ref _q) => {
+                let sql_frag = &self.build_query(&_q, w.build_mode.clone());
+                w.append(&sql_frag.sql);
+            }
+        }
+    }
+
+    fn build_source_field(&self,
+                          w: &mut SqlFrag,
+                          parent_query: &Query,
+                          source_field: &SourceField) {
+        self.build_query_source(w, parent_query, &source_field.source);
+        match source_field.rename {
+            Some(ref rename) => {
+                w.append(" AS ");
+                w.append(rename);
+            }
+            None => (),
+        }
+    }
 
     fn build_filter(&self, w: &mut SqlFrag, parent_query: &Query, filter: &Filter) {
-        if !filter.subfilters.is_empty() {
+        if !filter.sub_filters.is_empty() {
             w.append("( ");
         }
         self.build_condition(w, parent_query, &filter.condition);
-        for filt in &filter.subfilters {
+        w.sp();
+        for filt in &filter.sub_filters {
             match filt.connector {
                 Connector::And => {
                     w.append("AND ");
@@ -330,18 +478,18 @@ pub trait Database{
             }
             self.build_filter(w, parent_query, filt);// build sub filters as well
         }
-        if !filter.subfilters.is_empty() {
+        if !filter.sub_filters.is_empty() {
             w.append(" )");
         }
     }
 
     /// build the filter clause or the where clause of the query
     /// TODO: add the sub filters
-    fn build_filters(&self, w: &mut SqlFrag, parent_query: &Query, filters: &Vec<Filter>) {
+    fn build_filters(&self, w: &mut SqlFrag, parent_query: &Query, filters: &[Filter]) {
         let mut do_and = false;
         for filter in filters {
             if do_and {
-                w.left_river("AND ");
+                w.left_river(" AND ");
             } else {
                 do_and = true;
             }
@@ -353,7 +501,7 @@ pub trait Database{
     fn build_enumerated_fields(&self,
                                w: &mut SqlFrag,
                                parent_query: &Query,
-                               enumerated_fields: &Vec<Field>) {
+                               enumerated_fields: &[Field]) {
         let mut do_comma = false;
         let mut cnt = 0;
         for field in enumerated_fields {
@@ -363,7 +511,8 @@ pub trait Database{
                 do_comma = true;
             }
             cnt += 1;
-            if cnt % 4 == 0 {//break at every 4 columns to encourage sql tuning/revising
+            if cnt % 4 == 0 {
+                // break at every 4 columns to encourage sql tuning/revising
                 w.left_river("");
             }
             self.build_field(w, parent_query, field);
@@ -371,20 +520,22 @@ pub trait Database{
     }
 
     /// build the select statment from the query object
-    fn build_select(&self, query: &Query) -> SqlFrag {
-        let mut w = SqlFrag::new(self.sql_options());
+    fn build_select(&self, query: &Query, build_mode: BuildMode) -> SqlFrag {
+        let mut w = SqlFrag::new(self.sql_options(), build_mode);
         w.left_river("SELECT");
         self.build_enumerated_fields(&mut w, query, &query.enumerated_fields); //TODO: add support for column_sql, fields, functions
         w.left_river("FROM");
 
-        assert!(query.from.is_some(),
+        assert!(!query.from.is_empty(),
                 "There should be table, query, function to select from");
-
-        match query.from {
-            Some(ref field) => {
-                self.build_field(&mut w, query, field);
+        let mut do_comma = false;
+        for field in &query.from {
+            if do_comma {
+                w.commasp();
+            } else {
+                do_comma = true;
             }
-            None => println!("Warning: No from in this query"),
+            self.build_source_field(&mut w, query, field);
         }
         if !query.joins.is_empty() {
             for join in &query.joins {
@@ -401,33 +552,18 @@ pub trait Database{
                 match join.join_type {
                     Some(ref join_type) => {
                         match *join_type {
-                            JoinType::CROSS => w.append("CROSS "),
-                            JoinType::INNER => w.append("INNER "),
-                            JoinType::OUTER => w.append("OUTER "),
+                            JoinType::CROSS => w.right_river("CROSS "),
+                            JoinType::INNER => w.right_river("INNER "),
+                            JoinType::OUTER => w.right_river("OUTER "),
+                            JoinType::NATURAL => w.right_river("NATURAL "),
                         };
                     }
                     None => (),
                 }
                 w.append("JOIN ");
                 w.append(&join.table_name.complete_name());
-                w.append(" ");
-                assert!(join.column1.len() == join.column2.len(),
-                        "There should be equal number of corresponding columns to join");
-                let mut cnt = 0;
-                let mut do_and = false;
-                for jc in &join.column1 {
-                    if do_and {
-                        w.right_river("AND ");
-                    } else {
-                        w.right_river("ON ");
-                        do_and = true;
-                    }
-                    w.append(jc);
-                    w.append(" = ");
-                    w.append(&join.column2[cnt]);
-                    w.append(" ");
-                    cnt += 1;
-                }
+                w.right_river("ON ");
+                self.build_filter(&mut w, query, &join.on);
             }
         }
 
@@ -459,42 +595,50 @@ pub trait Database{
                 } else {
                     do_comma = true;
                 }
-                self.build_condition(&mut w, query, hav);
+                self.build_filter(&mut w, query, hav);
             }
         }
 
         if !query.order_by.is_empty() {
             w.left_river("ORDER BY ");
             let mut do_comma = false;
-            for &(ref column, ref direction) in &query.order_by {
+            for order in &query.order_by {
                 if do_comma {
                     w.commasp();
                 } else {
                     do_comma = true;
                 }
-                w.append(&column);
-                match *direction {
-                    Direction::ASC => w.append(" ASC"),
-                    Direction::DESC => w.append(" DESC"),
+                self.build_operand(&mut w, query, &order.operand);
+                match &order.direction {
+                    &Some(ref direction) => {
+                        match direction {
+                            &Direction::ASC => w.append(" ASC"),
+                            &Direction::DESC => w.append(" DESC"),
+                        }
+                    }
+                    &None => w.append(""),
+                };
+                match &order.nulls_where {
+                    &Some(ref nulls_where) => {
+                        match nulls_where {
+                            &NullsWhere::FIRST => w.append(" NULLS FIRST"),
+                            &NullsWhere::LAST => w.append(" NULLS LAST"),
+                        }
+                    }
+                    &None => w.append(""),
                 };
             }
         }
-
-        match query.page_size {
-            Some(page_size) => {
+        match query.range.limit {
+            Some(limit) => {
                 w.left_river("LIMIT ");
-                w.append(&format!("{}", page_size));
+                w.append(&format!("{}", limit));
             }
             None => (),
         }
-
-        match query.page {
-            Some(page) => {
+        match query.range.offset {
+            Some(offset) => {
                 w.left_river("OFFSET ");
-                assert!(query.page_size.is_some(),
-                        "Page size should be specified when paging");
-                let page_size = query.page_size.unwrap();
-                let offset = page * page_size;
                 w.append(&format!("{}", offset));
             }
             None => (),
@@ -502,16 +646,16 @@ pub trait Database{
         w
     }
 
-    /// TODO complete this
-    fn build_insert(&self, query: &Query) -> SqlFrag {
-        println!("building insert query");
-        let mut w = SqlFrag::new(self.sql_options());
+    /// TODO: when the number of values is greater than the number of columns
+    /// wrap it into another set and make sure the values are in multiples of the the n columns
+    /// http://www.postgresql.org/docs/9.0/static/dml-insert.html
+    fn build_insert(&self, query: &Query, build_mode: BuildMode) -> SqlFrag {
+        let mut w = SqlFrag::new(self.sql_options(), build_mode);
         w.left_river("INSERT");
         w.append("INTO ");
         let into_table = query.get_from_table();
         assert!(into_table.is_some(), "There should be table to insert to");
-        if into_table.is_some() {
-            let table_name = into_table.unwrap();
+        if let Some(table_name) = into_table {
             if self.sql_options().contains(&SqlOption::UsesSchema) {
                 w.append(&table_name.complete_name());
             } else {
@@ -558,13 +702,13 @@ pub trait Database{
     }
 
 
-    fn build_update(&self, query: &Query) -> SqlFrag {
-        let mut w = SqlFrag::new(self.sql_options());
+    fn build_update(&self, query: &Query, build_mode: BuildMode) -> SqlFrag {
+        let mut w = SqlFrag::new(self.sql_options(), build_mode);
         w.left_river("UPDATE ");
         let from_table = query.get_from_table();
         assert!(from_table.is_some(), "There should be table to update from");
-        if from_table.is_some() {
-            w.append(&from_table.unwrap().complete_name());
+        if let Some(ref from) = from_table {
+            w.append(&from.complete_name());
         }
         let enumerated_columns = query.get_enumerated_columns();
         let mut do_comma = false;
@@ -581,11 +725,8 @@ pub trait Database{
             w.append(&ec.column);
             w.append(" = ");
             let value = &query.values[column_index];
-            match value {
-                &Operand::Value(ref value) => {
-                    w.parameter(value.clone());
-                }
-                _ => {}
+            if let &Operand::Value(ref value) = value {
+                w.parameter(value.clone());
             }
             column_index += 1;
         }
@@ -611,13 +752,13 @@ pub trait Database{
         w
     }
 
-    fn build_delete(&self, query: &Query) -> SqlFrag {
-        let mut w = SqlFrag::new(self.sql_options());
+    fn build_delete(&self, query: &Query, build_mode: BuildMode) -> SqlFrag {
+        let mut w = SqlFrag::new(self.sql_options(), build_mode);
         w.left_river("DELETE FROM ");
         let from_table = query.get_from_table();
         assert!(from_table.is_some(), "There should be table to delete from");
-        if from_table.is_some() {
-            w.append(&from_table.unwrap().complete_name());
+        if let Some(ref from) = from_table {
+            w.append(&from.complete_name());
         }
         if !query.filters.is_empty() {
             w.left_river("WHERE ");
@@ -627,15 +768,14 @@ pub trait Database{
     }
 
     fn sql_options(&self) -> Vec<SqlOption>;
-
 }
 
 
 /// Deployment Database should implement this trait,
 /// to enable automated installation of the app, regardless what database platform
 /// the app is developed from.
-pub trait DatabaseDDL{
-    //////////////////////////////////////////
+pub trait DatabaseDDL {
+    /// ///////////////////////////////////////
     /// The following methods involves DDL(Data definition language) operation
     // //////////////////////////////////////
     /// create a database schema
@@ -666,9 +806,8 @@ pub trait DatabaseDDL{
 
 /// implement this for database that you use as your development platform, to extract meta data information
 /// about the tables and their relationship to each other
-pub trait DatabaseDev{
-
-////////////////////////////////////////
+pub trait DatabaseDev {
+    /// /////////////////////////////////////
     /// Database interface use for the development process
     // //////////////////////////////////////////
     /// applicable to later version of postgresql where there is inheritance
@@ -676,7 +815,10 @@ pub trait DatabaseDev{
 
     fn get_parent_table(&self, schema: &str, table: &str) -> Option<String>;
 
-    ////
+
+    fn get_row_count_estimate(&self, schema: &str, table: &str) -> Option<usize>;
+
+    /// /
     /// Build the Table object based on the extracted meta data info from database
     /// This is queries directly from the database, so this will be costly. Only used this on initialization processes
     ///
@@ -688,10 +830,9 @@ pub trait DatabaseDev{
     /// get the inherited columns of this table
     fn get_inherited_columns(&self, schema: &str, table: &str) -> Vec<String>;
 
-    ///get the equivalent postgresql database data type to rust data type
+    /// get the equivalent postgresql database data type to rust data type
     /// returns (module, type)
-    fn dbtype_to_rust_type(&self, db_type: &str) -> (Vec<String>, String);
+    fn dbtype_to_rust_type(&self, db_type: &str) -> (Vec<String>, Type);
 
-    fn rust_type_to_dbtype(&self, rust_type: &str) -> String;
-
+    fn rust_type_to_dbtype(&self, rust_type: &Type) -> String;
 }

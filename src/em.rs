@@ -14,7 +14,7 @@ pub struct EntityManager<'a> {
     pub db: &'a Database,
 }
 
-impl <'a>EntityManager<'a>{
+impl <'a>EntityManager<'a> {
 
     /// Create an entity manager with the database connection provided
     pub fn new(db: &'a Database) -> Self {
@@ -24,7 +24,7 @@ impl <'a>EntityManager<'a>{
     /// delete records of this table
     pub fn delete(&self, table: &Table, filters: Vec<Filter>) -> usize {
         let mut query = Query::delete();
-        query.from(table);
+        query.FROM(table);
         for filter in filters {
             query.add_filter(filter);
         }
@@ -39,8 +39,8 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select_all();
-        q.from_table(&table.complete_name());
+        let mut q = Query::SELECT_ALL();
+        q.FROM(&table);
         q.collect(self.db)
     }
 
@@ -49,8 +49,8 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select();
-        q.from_table(&table.complete_name());
+        let mut q = Query::SELECT();
+        q.FROM(&table);
         q.columns(columns);
         q.collect(self.db)
     }
@@ -60,8 +60,8 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select();
-        q.from_table(&table.complete_name());
+        let mut q = Query::SELECT();
+        q.FROM(&table);
         for c in table.columns {
             q.column(&c.name);
         }
@@ -75,9 +75,9 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select_all();
+        let mut q = Query::SELECT_ALL();
         q.distinct();
-        q.from_table(&table.complete_name());
+        q.FROM(&table);
         q.collect(self.db)
     }
 
@@ -87,8 +87,8 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select_all();
-        q.from_table(&table.complete_name());
+        let mut q = Query::SELECT_ALL();
+        q.FROM(&table);
         for f in filters {
             q.add_filter(f);
         }
@@ -100,14 +100,14 @@ impl <'a>EntityManager<'a>{
         where T: IsTable + IsDao
     {
         let table = T::table();
-        let mut q = Query::select_all();
-        q.from_table(&table.complete_name());
+        let mut q = Query::SELECT_ALL();
+        q.FROM(&table);
         q.add_filter(filter);
         q.collect_one(self.db)
     }
-    /// 
+    ///
     /// get an exact match, the value is filter against the primary key of the table
-    /// 
+    ///
     pub fn get_exact<T>(&self, id: &ToValue) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
@@ -115,29 +115,31 @@ impl <'a>EntityManager<'a>{
         let primary = table.primary_columns();
         assert!(primary.len() == 1,
                 "There should only be 1 primary column for this to work");
-        let pk = primary[0].name.to_string();
+        let pk = primary[0].name.to_owned();
 
-        Query::select_all()
-            .from_table(&table.complete_name())
+        Query::SELECT_ALL()
+            .FROM(&table)
             .filter(&pk, Equality::EQ, id)
             .collect_one(self.db)
     }
 
-    pub fn insert<T>(&self, dao: Dao) -> Result<T, DbError>
+/// [FIXME] The arrangement of columns are off
+    pub fn insert<T>(&self, t: &T) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
         let table = T::table();
+        let dao = t.to_dao();
         let mut q = Query::insert();
-        q.into_table(&table.complete_name());
+        q.INTO(&table);
         for key in dao.values.keys() {
             q.column(key);
         }
         q.return_all();
-        for c in &table.columns {
-            let value = dao.values.get(&c.name);
+        for key in dao.values.keys() {
+            let value = dao.values.get(key);
             match value {
                 Some(value) => {
-                    q.add_value(Operand::Value(value.clone()));
+                    q.add_value(value);
                 }
                 None => (),
             }
@@ -156,7 +158,7 @@ impl <'a>EntityManager<'a>{
     {
         let table = T::table();
         let mut q = Query::insert();
-        q.into_table(&table.complete_name());
+        q.INTO(&table);
         for key in dao.values.keys() {
             q.column(key);
         }
@@ -166,7 +168,7 @@ impl <'a>EntityManager<'a>{
             let value = dao.values.get(&c.name);
             match value {
                 Some(value) => {
-                    q.add_value(Operand::Value(value.clone()));
+                    q.add_value(value);
                 }
                 None => (),
             }
@@ -177,62 +179,62 @@ impl <'a>EntityManager<'a>{
     /// insert this record on the database, explicitly setting the defaults of the columns
     /// it may produce the same result with insert_with_ignore_columns
     /// the query is different since it may mentions `created` now(),
-    pub fn insert_ignore_defaulted_columns<T>(&self, dao: Dao) -> Result<T, DbError>
+    pub fn insert_ignore_defaulted_columns<T>(&self, _dao: Dao) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// this is called when there is a problem with the transaction
     pub fn reset(&self) {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// when there is a problem with the transaction process, this can be called
     pub fn rollback(&self) {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// update the Dao, return the updated Dao
-    pub fn update<T>(&self, dao: &Dao) -> Result<T, DbError>
+    pub fn update<T>(&self, _dao: &Dao) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// update the Dao, return the updated Dao
     /// ignored columns will remain unchanged
     pub fn update_ignore_columns<T>(&self,
-                                    dao: &Dao,
-                                    ignore_columns: Vec<&str>)
+                                    _dao: &Dao,
+                                    _ignore_columns: Vec<&str>)
                                     -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// update the Dao, return the updated Dao
     /// only the columns specified, the rest is unchanged
-    pub fn update_only_columns<T>(&self, dao: &Dao, columns: Vec<&str>) -> Result<T, DbError>
+    pub fn update_only_columns<T>(&self, _dao: &Dao, _columns: Vec<&str>) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// update the Dao, return the updated Dao
     /// the default columns will be reset to whatever the db's default function will come up.
     /// ie. updated column will be defaulted everytime a record is updated.
-    pub fn update_ignore_defaulted_columns<T>(&self, dao: &Dao) -> Result<T, DbError>
+    pub fn update_ignore_defaulted_columns<T>(&self, _dao: &Dao) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// update the Dao with filter, return the updated Dao
-    pub fn update_with_filter<T>(&self, dao: &Dao, filter: Vec<Filter>) -> Result<T, DbError>
+    pub fn update_with_filter<T>(&self, _dao: &Dao, _filter: Vec<Filter>) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet")
+        unimplemented!()
     }
 
     /// whether to use insert or update
@@ -240,18 +242,20 @@ impl <'a>EntityManager<'a>{
     /// update when it is an existing recor
     /// may use UPSERT in newer versions of postgres
     /// may use MERGE in oracle, mssql
-    pub fn save<T>(&self, dao: T) -> Result<T, DbError>
+    pub fn save<T>(&self, _dao: T) -> Result<T, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet");
+        unimplemented!()
     }
+
     ///
     /// Search a set of record from the base Query that would have been returned by the base query
     ///
-    fn search<T>(&self, keyword: &str) -> Result<Vec<T>, DbError>
+    #[allow(dead_code)]
+    fn search<T>(&self, _keyword: &str) -> Result<Vec<T>, DbError>
         where T: IsTable + IsDao
     {
-        panic!("not yet");
+        unimplemented!()
     }
 
 }

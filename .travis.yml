@@ -1,11 +1,34 @@
+os:
+ - linux
+ - osx
+
 language: rust
+
 rust:
 - nightly
 - beta
 - stable
 addons:
   postgresql: 9.4
+install:
+ - if [[ $(uname -s) == 'Darwin' ]]; then
+       brew rm postgis --force;
+       brew install postgis --force;
+       pg_ctl -w start -l postgres.log --pgdata /usr/local/var/postgres;
+       createuser -s postgres; 
+   else
+       echo "Not on darwin";
+  fi
 before_script:
-- "./scripts/setup.sh"
+ - "./scripts/setup.sh"
+
+after_success: |
+  sudo apt-get install libcurl4-openssl-dev libelf-dev libdw-dev &&
+  wget https://github.com/SimonKagstrom/kcov/archive/master.tar.gz &&
+  tar xzf master.tar.gz && mkdir kcov-master/build && cd kcov-master/build && cmake .. && make &&
+  sudo make install && cd ../.. &&
+  kcov --coveralls-id=$TRAVIS_JOB_ID --exclude-pattern=/.cargo target/kcov target/debug/rustorm-*
+  
 script:
-- cargo test --features sqlite
+- cargo test
+- cargo test --features "sqlite mysql"
